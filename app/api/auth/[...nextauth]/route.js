@@ -10,6 +10,20 @@ export const authOptions = {
     }),
   ],
   secret: process.env.NEXTAUTH_SECRET,
+  callbacks: {
+    async jwt({ token, account }) {
+      // Save the access token to the token object on sign in
+      if (account) {
+        token.accessToken = account.access_token;
+      }
+      return token;
+    },
+    async session({ session, token }) {
+      // Add the access token to the session
+      session.accessToken = token.accessToken;
+      return session;
+    },
+  },
 };
 
 // Create the NextAuth handler
