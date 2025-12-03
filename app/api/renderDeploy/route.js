@@ -1,127 +1,117 @@
 import { NextResponse } from "next/server";
 import { exec } from "child_process";
+import { promisify } from "util";
 import simpleGit from "simple-git";
 import fs from "fs";
 import path from "path";
+import os from "os";
 
+const execAsync = promisify(exec);
 
 export const runtime = "nodejs";
-
-function run(cmd, cwd) {
-  return new Promise((resolve, reject) => {
-    exec(cmd, { cwd, maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
-      if (err) return reject(stderr || err.message);
-      resolve(stdout);
-    });
-  });
-}
+export const maxDuration = 300; // 5 minutes for deployment
 
 export async function POST(req) {
+  let repoDir = null;
+  
   try {
-    const { repoUrl, vercelToken, framework, buildCommand, outputDirectory } = await req.json();
+    const { repoUrl, projectDirectory } = await req.json();
+    const vercelToken = process.env.VERCEL_TOKEN;
 
-    if (!repoUrl || !vercelToken) {
+    if (!vercelToken) {
       return NextResponse.json(
-        { error: "Missing required fields" },
+        { error: "Vercel token not configured" },
+        { status: 500 }
+      );
+    }
+
+    if (!repoUrl) {
+      return NextResponse.json(
+        { error: "Repository URL is required" },
         { status: 400 }
       );
     }
 
-    const repoDir = `/tmp/repo-${Date.now()}`;
+    // Create temp directory
+    repoDir = path.join(os.tmpdir(), `deploy-${Date.now()}`);
     const git = simpleGit();
 
-    console.log("Cloning repository...");
+    console.log("Step 1: Cloning repository...");
     await git.clone(repoUrl, repoDir);
 
-    console.log("Installing dependencies...");
-    await run("npm install", repoDir);
+    // Determine working directory
+    const workDir = projectDirectory 
+      ? path.join(repoDir, projectDirectory)
+      : repoDir;
 
-    console.log("Building project...");
-    await run(buildCommand || "npm run build", repoDir);
-
-    // Determine build output directory
-    const outputDir = outputDirectory || "dist";
-    const distPath = path.join(repoDir, outputDir);
-
-    if (!fs.existsSync(distPath)) {
-      throw new Error(`Output directory "${outputDir}" not found after build`);
+    if (!fs.existsSync(workDir)) {
+      throw new Error(`Directory "${projectDirectory}" not found in repository`);
     }
 
-    console.log("Reading build files...");
-    function walk(dir) {
-      let out = [];
-      const items = fs.readdirSync(dir);
-      
-      for (const item of items) {
-        const fullPath = path.join(dir, item);
-        const stat = fs.statSync(fullPath);
-        
-        if (stat.isDirectory()) {
-          out = out.concat(walk(fullPath));
-        } else {
-          const relativePath = fullPath.replace(distPath + path.sep, "").replace(/\\/g, "/");
-          out.push({
-            file: relativePath,
-            data: fs.readFileSync(fullPath).toString("base64"),
-          });
+    // Check for package.json
+    if (!fs.existsSync(path.join(workDir, "package.json"))) {
+      throw new Error("package.json not found in project directory");
+    }
+
+    console.log("Step 2: Installing dependencies...");
+    await execAsync("npm install", { cwd: workDir, maxBuffer: 10 * 1024 * 1024 });
+
+    console.log("Step 3: Deploying to Vercel...");
+    
+    // Deploy using Vercel CLI
+    const { stdout, stderr } = await execAsync(
+      `npx vercel --prod --token ${vercelToken} --yes`,
+      { 
+        cwd: workDir,
+        maxBuffer: 10 * 1024 * 1024,
+        env: {
+          ...process.env,
+          VERCEL_TOKEN: vercelToken,
         }
       }
-      return out;
+    );
+
+    console.log("Vercel output:", stdout);
+    if (stderr) console.error("Vercel stderr:", stderr);
+
+    // Extract URL from output
+    const urlMatch = stdout.match(/https:\/\/[^\s]+\.vercel\.app/);
+    const deploymentUrl = urlMatch ? urlMatch[0] : null;
+
+    if (!deploymentUrl) {
+      throw new Error("Could not extract deployment URL from Vercel output");
     }
-
-    const files = walk(distPath);
-    console.log(`Found ${files.length} files to deploy`);
-
-    // Extract repo name from URL
-    const repoName = repoUrl.split("/").pop().replace(".git", "");
-
-    console.log("Deploying to Vercel...");
-    const res = await fetch("https://api.vercel.com/v13/deployments", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${vercelToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        name: repoName,
-        files,
-        projectSettings: {
-          framework: framework || "vite",
-          outputDirectory: outputDir,
-        },
-      }),
-    });
-
-    const json = await res.json();
 
     // Cleanup
     try {
       fs.rmSync(repoDir, { recursive: true, force: true });
-    } catch (cleanupErr) {
-      console.error("Cleanup error:", cleanupErr);
+    } catch (e) {
+      console.error("Cleanup error:", e);
     }
-
-    if (!res.ok) {
-      return NextResponse.json(
-        { error: json.error?.message || "Deployment failed" },
-        { status: res.status }
-      );
-    }
-
-    // Extract deployment URL from Vercel response
-    const deploymentUrl = json.url || json.alias?.[0] || null;
 
     return NextResponse.json({
       success: true,
       url: deploymentUrl,
-      id: json.id,
-      readyState: json.readyState,
-      inspectorUrl: json.inspectorUrl,
+      message: "Deployment successful! Your site is now live.",
     });
-  } catch (e) {
-    console.error("Deployment error:", e);
+
+  } catch (error) {
+    // Cleanup on error
+    if (repoDir && fs.existsSync(repoDir)) {
+      try {
+        fs.rmSync(repoDir, { recursive: true, force: true });
+      } catch (e) {
+        console.error("Cleanup error:", e);
+      }
+    }
+
+    console.error("Deployment error:", error);
+    
     return NextResponse.json(
-      { error: e.toString() },
+      { 
+        error: error.message || "Deployment failed",
+        details: error.toString()
+      },
       { status: 500 }
     );
   }
